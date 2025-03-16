@@ -1,0 +1,144 @@
+import wave
+import numpy as np
+import time
+from collections import Counter
+import heapq
+import pandas as pd
+import scipy.io.wavfile as wavfile
+import pickle
+
+# pcm extraction (16bit, 8000hz)
+def extract_pcm_fixed(wav_file_path):
+    with wave.open(wav_file_path, 'rb') as wav_file:
+        n_channels, sampwidth, framerate, n_frames, _, _ = wav_file.getparams()
+        print(f"channels: {n_channels}, sample width: {sampwidth}, frame rate: {framerate} hz, frames: {n_frames}")
+        if sampwidth != 2:
+            raise ValueError("only 16-bit pcm is supported")
+        if framerate != 8000:
+            print("⚠️ warning: input file is not 8000hz")
+        frames = wav_file.readframes(n_frames)
+        pcm_data = np.frombuffer(frames, dtype=np.int16)
+        if n_channels == 2:
+            pcm_data = pcm_data[::2]
+    return pcm_data
+
+# huffman node
+class Node:
+    def __init__(self, freq, symbol, left=None, right=None):
+        self.freq = freq
+        self.symbol = symbol
+        self.left = left
+        self.right = right
+
+    def __lt__(self, other):
+        return self.freq < other.freq
+
+# build huffman tree
+def build_huffman_tree(freq_dict):
+    heap = [Node(freq, symbol) for symbol, freq in freq_dict.items()]
+    heapq.heapify(heap)
+    while len(heap) > 1:
+        left, right = heapq.heappop(heap), heapq.heappop(heap)
+        heapq.heappush(heap, Node(left.freq + right.freq, (left.symbol, right.symbol), left, right))
+    return heap[0]
+
+# generate huffman codes
+def generate_huffman_codes(node, code='', code_dict=None):
+    if code_dict is None:
+        code_dict = {}
+    if node.left is None and node.right is None:
+        code_dict[node.symbol] = code
+    else:
+        generate_huffman_codes(node.left, code + '0', code_dict)
+        generate_huffman_codes(node.right, code + '1', code_dict)
+    return code_dict
+
+# encode using huffman
+def huffman_encode(data, code_dict):
+    return ''.join(code_dict[symbol] for symbol in data if symbol in code_dict)
+
+# decode huffman
+def huffman_decode(encoded_data, root):
+    decoded_output = []
+    node = root
+    for bit in encoded_data:
+        node = node.left if bit == '0' else node.right
+        if node.left is None and node.right is None:
+            decoded_output.append(node.symbol)
+            node = root
+    return decoded_output
+
+# measure code table size in mb
+def measure_huffman_table_size(code_table):
+    return len(pickle.dumps(code_table, protocol=pickle.HIGHEST_PROTOCOL)) / (1024 * 1024)
+
+# generate non-overlapping n-grams
+def create_n_grams_nonoverlapping(data, n=1):
+    return [tuple(data[i:i + n]) for i in range(0, len(data) - n + 1, n)]
+
+# save decoded data as wav
+def save_decoded_pcm_as_wav(decoded_data, output_path, n, original_dtype, sample_rate=8000):
+    flat_data = []
+    for item in decoded_data:
+        flat_data.extend(item if isinstance(item, tuple) else [item])
+    wavfile.write(output_path, sample_rate, np.array(flat_data, dtype=original_dtype))
+    print(f"decoded audio saved to {output_path}")
+
+# calculate accuracy
+def calculate_accuracy(original_data, decoded_data, n):
+    flat_decoded = []
+    for item in decoded_data:
+        flat_decoded.extend(item if isinstance(item, tuple) else [item])
+    min_length = min(len(original_data), len(flat_decoded))
+    correct = np.sum(original_data[:min_length] == flat_decoded[:min_length])
+    accuracy = correct / min_length
+    print(f"decoding accuracy: {accuracy:.4%}")
+    return accuracy
+
+# huffman pipeline for n-gram
+def run_huffman_n_gram_nonoverlapping(data, n=1, label='1-gram'):
+    n_grams = create_n_grams_nonoverlapping(data, n)
+    freq = Counter(n_grams)
+    tree = build_huffman_tree(freq)
+    codes = generate_huffman_codes(tree)
+
+    start_encode = time.time()
+    encoded_data = huffman_encode(n_grams, codes)
+    end_encode = time.time()
+
+    start_decode = time.time()
+    decoded_data = huffman_decode(encoded_data, tree)
+    end_decode = time.time()
+
+    compression_ratio = len(encoded_data) / (len(n_grams) * 16 * n)
+    output_wav = f"decoded_output_{n}-gram_nonoverlap.wav"
+    save_decoded_pcm_as_wav(decoded_data, output_wav, n=n, original_dtype=np.int16)
+    accuracy = calculate_accuracy(data[:len(n_grams) * n], decoded_data, n=n)
+
+    print(f"\n====== {label} huffman coding results ======")
+    print(f"table size (MB): {measure_huffman_table_size(codes):.2f}")
+    print(f"encoding time: {end_encode - start_encode:.4f} s")
+    print(f"decoding time: {end_decode - start_decode:.4f} s")
+    print(f"compression ratio: {1 - compression_ratio:.4f}")
+    print(f"decoding accuracy: {accuracy:.4%}")
+
+    return {
+        'Type': label,
+        'Num Symbols': len(codes),
+        'Encoding Time (s)': round(end_encode - start_encode, 4),
+        'Decoding Time (s)': round(end_decode - start_decode, 4),
+        'Compression Ratio': round(compression_ratio, 4),
+        'Decoding Accuracy (%)': round(accuracy * 100, 2)
+    }
+
+# main
+if __name__ == "__main__":
+    wav_file = '/Users/xuyuhan/PycharmProjects/pythonProject/Data compression/combined.wav'
+    pcm_data = extract_pcm_fixed(wav_file)
+
+    results = []
+    results.append(run_huffman_n_gram_nonoverlapping(pcm_data, n=1, label='single character (1-gram)'))
+    results.append(run_huffman_n_gram_nonoverlapping(pcm_data, n=2, label='two characters (bigram)'))
+    results.append(run_huffman_n_gram_nonoverlapping(pcm_data, n=3, label='three characters (trigram)'))
+    results.append(run_huffman_n_gram_nonoverlapping(pcm_data, n=4, label='four characters (4-gram)'))
+
