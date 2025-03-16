@@ -1,0 +1,167 @@
+import os
+import pickle
+import heapq
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.io.wavfile import read as wav_read, write as wav_write
+
+# huffman tree node
+class Node:
+    def __init__(self, symbol, freq, left=None, right=None):
+        self.symbol = symbol  # 2-symbol tuple or UNK=-1
+        self.freq = freq
+        self.left = left
+        self.right = right
+
+    def __lt__(self, other):
+        return self.freq < other.freq
+
+# build huffman tree from symbols and frequencies
+def build_huffman_tree(symbols, freqs):
+    heap = [Node(s, f) for s, f in zip(symbols, freqs)]
+    heapq.heapify(heap)
+    while len(heap) > 1:
+        n1, n2 = heapq.heappop(heap), heapq.heappop(heap)
+        heapq.heappush(heap, Node(None, n1.freq + n2.freq, n1, n2))
+    return heap[0]
+
+# generate code table from huffman tree
+def build_huffman_code_table(root):
+    code_table = {}
+    def dfs(node, code):
+        if node.symbol is not None:
+            code_table[node.symbol] = code
+            return
+        dfs(node.left, code + "0")
+        dfs(node.right, code + "1")
+    dfs(root, "")
+    return code_table
+
+# encode symbol sequence into bit string
+def huffman_encode(data, code_table, unk_symbol=(-1, -1)):
+    encoded_bits, missing_count = [], 0
+    for symbol in data:
+        if symbol in code_table:
+            encoded_bits.append(code_table[symbol])
+        else:
+            encoded_bits.append(code_table[unk_symbol])
+            missing_count += 1
+    if missing_count > 0:
+        print(f"[warning] {missing_count} unknown symbols encoded as UNK")
+    return "".join(encoded_bits)
+
+# decode bit string into symbol sequence
+def huffman_decode(encoded_str, root):
+    decoded_symbols, node = [], root
+    for bit in encoded_str:
+        node = node.left if bit == '0' else node.right
+        if node.symbol is not None:
+            decoded_symbols.append(node.symbol)
+            node = root
+    return decoded_symbols
+
+# measure code table size in bytes
+def measure_table_size(code_table):
+    return len(pickle.dumps(code_table, protocol=pickle.HIGHEST_PROTOCOL))
+
+# plot fft spectrum of audio
+def plot_spectrum(signal, sr, title="Spectrum"):
+    fft_data = np.fft.fft(signal.astype(np.float32)) / len(signal)
+    freq = np.fft.fftfreq(len(signal), d=1.0/sr)
+    plt.figure()
+    plt.plot(freq[:len(freq)//2], np.abs(fft_data)[:len(freq)//2])
+    plt.title(title)
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Magnitude")
+    plt.show()
+
+# main function
+def main():
+    input_wav = "/Users/xuyuhan/PycharmProjects/pythonProject/Data compression/combined.wav"
+    output_dir = "/Users/xuyuhan/PycharmProjects/pythonProject/Data compression/q2"
+    os.makedirs(output_dir, exist_ok=True)
+    train_ratios = [0.1, 0.2, 0.5, 0.8, 1.0]
+
+    # load audio
+    sr, data = wav_read(input_wav)
+    if data.ndim > 1:
+        data = data[:, 0]  # mono channel
+    data_32 = data.astype(np.int32)
+    total_samples = len(data_32)
+    UNK_SYMBOL = (-1, -1)
+    original_bits = total_samples * 16
+
+    # convert to 2-symbol tuples
+    symbols_2 = [(data_32[i], data_32[i + 1]) for i in range(0, total_samples - 1, 2)]
+    print(f"total {len(symbols_2)} 2-symbol tuples")
+
+    results = []
+    for ratio in train_ratios:
+        train_size = max(1, int(len(symbols_2) * ratio))
+        train_data = symbols_2[:train_size]
+        ratio_percent = int(ratio * 100)
+        print(f"\n=== train ratio: {ratio_percent}% ===")
+
+        # collect frequency for training data
+        uniq_vals, freq_vals = np.unique(train_data, axis=0, return_counts=True)
+        uniq_vals = [tuple(x) for x in uniq_vals]
+        uniq_vals.append(UNK_SYMBOL)
+        freq_vals = np.append(freq_vals, 1)
+
+        # build huffman tree and code table
+        start_build = time.time()
+        root = build_huffman_tree(uniq_vals, freq_vals)
+        code_table = build_huffman_code_table(root)
+        build_time = time.time() - start_build
+        table_size = measure_table_size(code_table)
+
+        # encode
+        start_enc = time.time()
+        encoded_str = huffman_encode(symbols_2, code_table, unk_symbol=UNK_SYMBOL)
+        enc_time = time.time() - start_enc
+
+        # decode
+        start_dec = time.time()
+        decoded_symbols = huffman_decode(encoded_str, root)
+        dec_time = time.time() - start_dec
+
+        # compression ratio
+        compressed_bits = len(encoded_str)
+        comp_ratio = (1 - (compressed_bits / original_bits)) * 100 if compressed_bits else float('inf')
+
+        # accuracy
+        decoded_flat = []
+        for sym in decoded_symbols:
+            decoded_flat.extend(sym if sym != UNK_SYMBOL else (0, 0))
+        decoded_flat = np.array(decoded_flat[:total_samples], dtype=np.int32)
+        accuracy = (decoded_flat == data_32[:len(decoded_flat)]).mean() * 100
+
+        # save decoded audio
+        out_wav = os.path.join(output_dir, f"decoded_{ratio_percent}_2sym.wav")
+        wav_write(out_wav, sr, decoded_flat.astype(np.int16))
+        print(f"decoded audio saved: {out_wav}")
+
+        # record results
+        results.append({
+            "train_ratio": ratio,
+            "table_size_bytes": table_size,
+            "build_time": build_time,
+            "enc_time": enc_time,
+            "dec_time": dec_time,
+            "compressed_bits": compressed_bits,
+            "compression_ratio": comp_ratio,
+            "accuracy": accuracy
+        })
+
+    # summary
+    print("\n======= summary (2-symbol) =======")
+    print("ratio(%) | table size (B) | build(s) | enc(s) | dec(s) | compressed bits | ratio(%) | acc(%)")
+    for r in results:
+        rp = int(r['train_ratio'] * 100)
+        print(f"{rp:3d}%  | {r['table_size_bytes']:^14d} | {r['build_time']:^7.3f} | "
+              f"{r['enc_time']:^6.3f} | {r['dec_time']:^6.3f} | {r['compressed_bits']:^15d} | "
+              f"{r['compression_ratio']:^9.2f} | {r['accuracy']:^7.2f}")
+
+if __name__ == "__main__":
+    main()
